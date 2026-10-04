@@ -43,6 +43,7 @@ import ghidra.program.model.data.FunctionDefinition;
 import ghidra.program.model.data.Pointer;
 import ghidra.program.model.data.TypeDef;
 import ghidra.program.model.data.Undefined;
+import ghidra.program.model.lang.OperandType;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
@@ -51,6 +52,7 @@ import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.mem.Memory;
+import ghidra.program.model.scalar.Scalar;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.Namespace;
@@ -65,10 +67,12 @@ import ghidra.program.model.symbol.SymbolType;
 public class ExportMatchData extends GhidraScript {
 
 	/** Bump when the CSV columns change; mirrored in model.py (FORMAT_VERSION). */
-	private static final int FORMAT_VERSION = 2;
+	private static final int FORMAT_VERSION = 3;
 	/** Strings longer than this are truncated in the export. */
 	private static final int MAX_STRING_LENGTH = 1024;
 	private static final int READ_CHUNK = 1 << 20;
+	/** Instructions read for a code entry that has no function (see codeEntries). */
+	private static final int MAX_CODE_ENTRY_INSNS = 2000;
 
 	private Listing listing;
 	private FunctionManager fm;
@@ -84,6 +88,12 @@ public class ExportMatchData extends GhidraScript {
 	private final Map<Address, List<Address>> vtables = new TreeMap<>();
 	/** function entry -> list of (vtable start, slot index). */
 	private final Map<Address, List<Object[]>> vtableSlotsByFunction = new HashMap<>();
+	/**
+	 * Table slots that point to code where Ghidra has no function (common for virtual methods
+	 * nobody called directly). Exported as functions with defined=0 so they can be paired;
+	 * ApplyMatchTable creates the function when it applies markup there.
+	 */
+	private final Set<Address> codeEntries = new TreeSet<>();
 	/** data address -> functions referencing it. */
 	private final Map<Address, Set<Address>> dataReferencedBy = new TreeMap<>();
 
@@ -138,9 +148,10 @@ public class ExportMatchData extends GhidraScript {
 
 	/**
 	 * Finds runs of pointer-sized values in non-executable initialized memory that point at
-	 * function entries. A run starts at a referenced (or user-labelled) address and is split
-	 * whenever an interior slot is itself referenced. This covers MSVC and Itanium vtables as
-	 * well as other function pointer tables.
+	 * code: function entries, or instructions outside any function (methods Ghidra never made
+	 * into functions). A run starts at a referenced (or user-labelled) address, is split
+	 * whenever an interior slot is itself referenced, and must contain at least one function
+	 * entry. This covers MSVC and Itanium vtables as well as other function pointer tables.
 	 */
 	private void findVtables() throws Exception {
 		boolean bigEndian = memory.isBigEndian();
@@ -156,6 +167,7 @@ public class ExportMatchData extends GhidraScript {
 
 			Address runStart = null;
 			List<Address> run = null;
+			boolean runHasFunction = false;
 			byte[] buf = new byte[READ_CHUNK + ptrSize];
 			for (long chunk = first; chunk < size; chunk += READ_CHUNK) {
 				monitor.checkCancelled();
@@ -169,37 +181,42 @@ public class ExportMatchData extends GhidraScript {
 				}
 				for (int i = 0; i + ptrSize <= got && i < READ_CHUNK; i += ptrSize) {
 					Address slotAddr = blockStart.add(chunk + i);
-					Address target = functionAtPointer(readPointer(buf, i, bigEndian));
+					Address target = codeAtPointer(readPointer(buf, i, bigEndian));
 					if (target == null) {
-						closeRun(runStart, run);
+						closeRun(runStart, run, runHasFunction);
 						runStart = null;
 						run = null;
 						continue;
 					}
 					if (run != null && refMgr.hasReferencesTo(slotAddr)) {
-						closeRun(runStart, run);
+						closeRun(runStart, run, runHasFunction);
 						run = null;
 					}
 					if (run == null) {
 						runStart = slotAddr;
 						run = new ArrayList<>();
+						runHasFunction = false;
 					}
 					run.add(target);
+					runHasFunction |= fm.getFunctionAt(target) != null;
 				}
 			}
-			closeRun(runStart, run);
+			closeRun(runStart, run, runHasFunction);
 		}
 		for (Map.Entry<Address, List<Address>> e : vtables.entrySet()) {
 			List<Address> slots = e.getValue();
 			for (int i = 0; i < slots.size(); i++) {
+				if (fm.getFunctionAt(slots.get(i)) == null) {
+					codeEntries.add(slots.get(i));
+				}
 				vtableSlotsByFunction.computeIfAbsent(slots.get(i), k -> new ArrayList<>())
 						.add(new Object[] { e.getKey(), i });
 			}
 		}
 	}
 
-	private void closeRun(Address start, List<Address> run) {
-		if (start == null || run == null || run.isEmpty()) {
+	private void closeRun(Address start, List<Address> run, boolean hasFunction) {
+		if (start == null || run == null || run.isEmpty() || !hasFunction) {
 			return;
 		}
 		Symbol sym = symTab.getPrimarySymbol(start);
@@ -218,19 +235,30 @@ public class ExportMatchData extends GhidraScript {
 		return v;
 	}
 
-	private Address functionAtPointer(long value) {
+	private Address codeAtPointer(long value) {
 		if (value == 0) {
 			return null;
 		}
-		Address a = toDefaultAddress(value);
-		if (a != null && executeSet.contains(a) && fm.getFunctionAt(a) != null) {
+		Address a = codeEntryAt(toDefaultAddress(value));
+		if (a == null && isArm && (value & 1) == 1) { // Thumb pointers carry the low bit
+			a = codeEntryAt(toDefaultAddress(value - 1));
+		}
+		return a;
+	}
+
+	/**
+	 * The address if it starts a function, or starts an instruction that is not inside any
+	 * function (a pointer into the middle of a function is a label, e.g. a switch case).
+	 */
+	private Address codeEntryAt(Address a) {
+		if (a == null || !executeSet.contains(a)) {
+			return null;
+		}
+		if (fm.getFunctionAt(a) != null) {
 			return a;
 		}
-		if (isArm && (value & 1) == 1) { // Thumb pointers carry the low bit
-			a = toDefaultAddress(value - 1);
-			if (a != null && executeSet.contains(a) && fm.getFunctionAt(a) != null) {
-				return a;
-			}
+		if (listing.getInstructionAt(a) != null && fm.getFunctionContaining(a) == null) {
+			return a;
 		}
 		return null;
 	}
@@ -251,7 +279,8 @@ public class ExportMatchData extends GhidraScript {
 		try (PrintWriter w = writer(out)) {
 			w.println(csvRow("address", "name", "namespace", "is_default_name", "is_thunk",
 				"size", "insn_count", "mnemonic_hash", "vtable_slots", "string_refs", "callees",
-				"data_refs", "name_source", "signature_source"));
+				"data_refs", "name_source", "signature_source", "defined", "head_size",
+				"head_hash", "string_args"));
 			FunctionIterator it = fm.getFunctions(true);
 			while (it.hasNext()) {
 				monitor.checkCancelled();
@@ -262,8 +291,108 @@ public class ExportMatchData extends GhidraScript {
 				writeFunction(w, f);
 				count++;
 			}
+			for (Address a : codeEntries) {
+				monitor.checkCancelled();
+				writeCodeEntry(w, a);
+				count++;
+			}
 		}
 		return count;
+	}
+
+	/**
+	 * A table slot target without a function: its instructions are read in address order up
+	 * to the first one without fallthrough (return, unconditional jump), the next function or
+	 * code entry, or a gap.
+	 */
+	private void writeCodeEntry(PrintWriter w, Address entry) throws Exception {
+		LinkedHashSet<String> strings = new LinkedHashSet<>();
+		LinkedHashSet<String> callees = new LinkedHashSet<>();
+		LinkedHashSet<String> dataRefs = new LinkedHashSet<>();
+		MessageDigest md = MessageDigest.getInstance("SHA-1");
+		CallArgs callArgs = new CallArgs();
+		int insnCount = 0;
+		Address end = entry;
+		Instruction insn = listing.getInstructionAt(entry);
+		while (insn != null && insnCount < MAX_CODE_ENTRY_INSNS) {
+			Address at = insn.getAddress();
+			if (insnCount > 0 && (fm.getFunctionAt(at) != null || codeEntries.contains(at))) {
+				break;
+			}
+			insnCount++;
+			md.update(insn.getMnemonicString().getBytes(StandardCharsets.UTF_8));
+			md.update((byte) ';');
+			for (Reference ref : insn.getReferencesFrom()) {
+				callArgs.string(collectReference(ref, entry, strings, callees, dataRefs));
+			}
+			callArgs.instruction(insn);
+			end = insn.getMaxAddress();
+			if (!insn.getFlowType().hasFallthrough()) {
+				break;
+			}
+			Address next = end.next();
+			insn = next == null ? null : listing.getInstructionAt(next);
+		}
+
+		List<String> slots = new ArrayList<>();
+		for (Object[] s : vtableSlotsByFunction.getOrDefault(entry, List.of())) {
+			slots.add("[" + jsonString(addr((Address) s[0])) + "," + s[1] + "]");
+		}
+		Symbol sym = symTab.getPrimarySymbol(entry);
+		SourceType source = sym != null ? sym.getSource() : SourceType.DEFAULT;
+		String hash = insnCount == 0 ? "" : hex(md.digest()).substring(0, 16);
+		String size = Long.toString(end.subtract(entry) + 1);
+		w.println(csvRow(
+			addr(entry),
+			sym != null ? sym.getName() : "LAB_" + addr(entry),
+			sym != null ? namespacePath(sym.getParentNamespace()) : "",
+			source == SourceType.DEFAULT ? "1" : "0",
+			"0",
+			size,
+			Integer.toString(insnCount),
+			hash,
+			"[" + String.join(",", slots) + "]",
+			jsonArray(strings),
+			jsonArray(callees),
+			jsonArray(dataRefs),
+			source.name(),
+			SourceType.DEFAULT.name(),
+			"0",
+			size,
+			hash,
+			callArgs.json()));
+	}
+
+	/**
+	 * Size and mnemonic hash of the code from the entry up to the first instruction without
+	 * fallthrough, read the same way as for code entries, so functions and code entries can
+	 * be compared.
+	 */
+	private String[] head(Address entry) throws Exception {
+		MessageDigest md = MessageDigest.getInstance("SHA-1");
+		int n = 0;
+		Address end = entry;
+		Instruction insn = listing.getInstructionAt(entry);
+		while (insn != null && n < MAX_CODE_ENTRY_INSNS) {
+			Address at = insn.getAddress();
+			if (n > 0 && (fm.getFunctionAt(at) != null || codeEntries.contains(at))) {
+				break;
+			}
+			n++;
+			md.update(insn.getMnemonicString().getBytes(StandardCharsets.UTF_8));
+			md.update((byte) ';');
+			end = insn.getMaxAddress();
+			if (!insn.getFlowType().hasFallthrough()) {
+				break;
+			}
+			Address next = end.next();
+			insn = next == null ? null : listing.getInstructionAt(next);
+		}
+		if (n == 0) {
+			return new String[] { "0", "" };
+		}
+		return new String[] { Long.toString(end.subtract(entry) + 1),
+			hex(md.digest()).substring(0, 16) };
 	}
 
 	private void writeFunction(PrintWriter w, Function f) throws Exception {
@@ -272,6 +401,7 @@ public class ExportMatchData extends GhidraScript {
 		LinkedHashSet<String> callees = new LinkedHashSet<>();
 		LinkedHashSet<String> dataRefs = new LinkedHashSet<>();
 		MessageDigest md = MessageDigest.getInstance("SHA-1");
+		CallArgs callArgs = new CallArgs();
 		int insnCount = 0;
 
 		InstructionIterator insns = listing.getInstructions(f.getBody(), true);
@@ -281,14 +411,16 @@ public class ExportMatchData extends GhidraScript {
 			md.update(insn.getMnemonicString().getBytes(StandardCharsets.UTF_8));
 			md.update((byte) ';');
 			for (Reference ref : insn.getReferencesFrom()) {
-				collectReference(ref, entry, strings, callees, dataRefs);
+				callArgs.string(collectReference(ref, entry, strings, callees, dataRefs));
 			}
+			callArgs.instruction(insn);
 		}
 
 		List<String> slots = new ArrayList<>();
 		for (Object[] s : vtableSlotsByFunction.getOrDefault(entry, List.of())) {
 			slots.add("[" + jsonString(addr((Address) s[0])) + "," + s[1] + "]");
 		}
+		String[] head = head(entry);
 
 		w.println(csvRow(
 			addr(entry),
@@ -304,7 +436,60 @@ public class ExportMatchData extends GhidraScript {
 			jsonArray(callees),
 			jsonArray(dataRefs),
 			nameSource(f).name(),
-			f.getSignatureSource().name()));
+			f.getSignatureSource().name(),
+			"1",
+			head[0],
+			head[1],
+			callArgs.json()));
+	}
+
+	/**
+	 * Strings and small constants passed to the same call, e.g. the file path and line of
+	 * errorContext("expr", "D:\\...\\File.cpp", 0x9d). Collects what the instructions since
+	 * the previous call referenced and emits every (string, constant) combination when a call
+	 * is reached. Line numbers move a little between builds but keep their order.
+	 */
+	private static final class CallArgs {
+		private static final int MAX_PAIRS = 256;
+		private final List<String> strings = new ArrayList<>();
+		private final List<Long> numbers = new ArrayList<>();
+		private final LinkedHashSet<String> pairs = new LinkedHashSet<>();
+
+		void string(String s) {
+			if (s != null && strings.size() < 8) {
+				strings.add(s);
+			}
+		}
+
+		void instruction(Instruction insn) {
+			for (int op = 0; op < insn.getNumOperands(); op++) {
+				int type = insn.getOperandType(op);
+				if (!OperandType.isScalar(type) || OperandType.isDynamic(type) ||
+					OperandType.isAddress(type) || insn.getOperandReferences(op).length > 0) {
+					continue;
+				}
+				Scalar sc = insn.getScalar(op);
+				if (sc != null && sc.getValue() > 0 && sc.getValue() < 100_000 &&
+					numbers.size() < 8) {
+					numbers.add(sc.getValue());
+				}
+			}
+			if (insn.getFlowType().isCall()) {
+				for (String s : strings) {
+					for (long n : numbers) {
+						if (pairs.size() < MAX_PAIRS) {
+							pairs.add("[" + jsonString(s) + "," + n + "]");
+						}
+					}
+				}
+				strings.clear();
+				numbers.clear();
+			}
+		}
+
+		String json() {
+			return "[" + String.join(",", pairs) + "]";
+		}
 	}
 
 	private static boolean hasDefaultName(Function f) {
@@ -333,7 +518,8 @@ public class ExportMatchData extends GhidraScript {
 			dt instanceof FunctionDefinition;
 	}
 
-	private void collectReference(Reference ref, Address fromFunction, Set<String> strings,
+	/** Records one reference; returns the string it refers to, if any. */
+	private String collectReference(Reference ref, Address fromFunction, Set<String> strings,
 			Set<String> callees, Set<String> dataRefs) {
 		Address to = ref.getToAddress();
 		if (to.isExternalAddress()) {
@@ -343,23 +529,24 @@ public class ExportMatchData extends GhidraScript {
 					callees.add("EXT:" + s.getName());
 				}
 			}
-			return;
+			return null;
 		}
 		if (!to.isMemoryAddress()) {
-			return; // stack / register / constant
+			return null; // stack / register / constant
 		}
 		Function callee = fm.getFunctionAt(to);
-		if (callee != null) {
+		if (callee != null || codeEntries.contains(to)) {
 			// direct calls and taken function addresses (callbacks)
 			if (ref.getReferenceType().isCall() || ref.getReferenceType().isData()) {
 				callees.add(addr(to));
 			}
-			return;
+			return null;
 		}
 		if (executeSet.contains(to) || !ref.getReferenceType().isData()) {
-			return; // jumps / labels inside code
+			return null; // jumps / labels inside code
 		}
 		Address dataStart = to;
+		String found = null;
 		Data data = listing.getDataContaining(to);
 		if (data != null && data.isDefined()) {
 			dataStart = data.getAddress();
@@ -375,10 +562,12 @@ public class ExportMatchData extends GhidraScript {
 			}
 			if (s != null) {
 				strings.add(s);
+				found = s;
 			}
 		}
 		dataRefs.add(addr(dataStart));
 		dataReferencedBy.computeIfAbsent(dataStart, k -> new TreeSet<>()).add(fromFunction);
+		return found;
 	}
 
 	private static String stringValue(Data data) {

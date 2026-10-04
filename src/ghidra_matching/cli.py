@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import __version__
+from .contenders import write_contenders
 from .evaluate import evaluate
 from .matcher import MatchConfig, match
 from .model import FORMAT_VERSION, load_build
@@ -67,6 +68,11 @@ def cmd_pair(args: argparse.Namespace) -> int:
                 "the current ExportMatchData.java.",
                 file=sys.stderr,
             )
+    if args.contenders:
+        c = write_contenders(
+            result, Path(args.contenders), args.contender_threshold, args.max_contenders
+        )
+        print(f"wrote contenders for {c} marked-up functions to {args.contenders}", file=sys.stderr)
     if args.unmatched:
         u = write_unmatched(result, Path(args.unmatched))
         print(
@@ -126,6 +132,18 @@ def build_parser() -> argparse.ArgumentParser:
     pair.add_argument(
         "--unmatched", help="also write source items with user markup that found no pair"
     )
+    pair.add_argument(
+        "--contenders",
+        help="also write likely partners for marked-up functions that are unmatched or "
+        "paired with low confidence",
+    )
+    pair.add_argument(
+        "--contender-threshold",
+        type=float,
+        default=0.5,
+        help="list contenders for pairs below this confidence (default 0.5)",
+    )
+    pair.add_argument("--max-contenders", type=int, default=5)
     pair.add_argument(
         "--all",
         action="store_true",

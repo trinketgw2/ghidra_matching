@@ -7,6 +7,8 @@ rem
 rem The source is the build that has your markup; builds are given as for export.bat. Writes
 rem   <OUT_DIR>\pairs_<source>_to_<target>.csv      items with your markup and their new address
 rem   <OUT_DIR>\unmatched_<source>_to_<target>.csv  items with your markup that found no partner
+rem   <OUT_DIR>\contenders_<source>_to_<target>.csv likely partners for unmatched or weakly
+rem                                                 paired functions with your markup
 setlocal
 call "%~dp0config.bat"
 if errorlevel 1 exit /b 1
@@ -24,4 +26,4 @@ set "PY=%REPO%\.venv\Scripts\python.exe"
 if not exist "%PY%" set "PY=python"
 if not exist "%OUT_PATH%" mkdir "%OUT_PATH%"
 
-"%PY%" -m ghidra_matching pair "%EXPORT_PATH%\%S_LABEL%" "%EXPORT_PATH%\%T_LABEL%" -o "%OUT_PATH%\pairs_%S_LABEL%_to_%T_LABEL%.csv" --unmatched "%OUT_PATH%\unmatched_%S_LABEL%_to_%T_LABEL%.csv"
+"%PY%" -m ghidra_matching pair "%EXPORT_PATH%\%S_LABEL%" "%EXPORT_PATH%\%T_LABEL%" -o "%OUT_PATH%\pairs_%S_LABEL%_to_%T_LABEL%.csv" --unmatched "%OUT_PATH%\unmatched_%S_LABEL%_to_%T_LABEL%.csv" --contenders "%OUT_PATH%\contenders_%S_LABEL%_to_%T_LABEL%.csv"

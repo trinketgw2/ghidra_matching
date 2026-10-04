@@ -31,7 +31,7 @@ debug info (`FUN_…`, `switchD_…`, `caseD_…`, `ImgDelayDescr@…`, imported
 | Function signature | The signature was set by a user, or the function has a user-set name and an imported signature. This covers the return type, parameter names and types, calling convention, varargs and noreturn. Types used in the signature are copied too. |
 | Data label and namespace | The label was set by a user. |
 | Data type of a global | The global has a label you set. Structures, arrays and pointers are all fine. |
-| Type definitions | Every structure, union, enum, typedef and function definition in the source program is copied first, including ones you have not applied anywhere yet (`copy_types=local`). |
+| Type definitions | Every structure, union, enum, typedef and function definition in the source program or in a project data type archive is copied first, including ones you have not applied anywhere yet (`copy_types=local`). |
 
 Markup already in the target is kept. Default, analysis and AI names in the target are
 replaced; names set by a user or imported there are replaced only with `overwrite=true`.
@@ -124,9 +124,9 @@ It does three things:
    seconds. It stops if the exe is identical to the source's (there is no new build yet;
    `--force` overrides this) or if the folder already exists. With `--existing`, it
    exports that build.
-3. Pairs the two builds, writes `pairs_<source>_to_<target>.csv` and
-   `unmatched_<source>_to_<target>.csv` to `OUT_DIR`, and prints the `apply.bat` commands
-   to run next.
+3. Pairs the two builds, writes `pairs_<source>_to_<target>.csv`,
+   `unmatched_<source>_to_<target>.csv` and `contenders_<source>_to_<target>.csv` to
+   `OUT_DIR`, and prints the `apply.bat` commands to run next.
 
 Started without arguments, or by double-clicking, it asks for what it needs. Full Ghidra
 logs go to `OUT_DIR\logs\`. On any operating system the same command is
@@ -149,6 +149,17 @@ changes the target and saves it. Back up the project folder before the first rea
 The pairing table lists only items that carry your markup. Its `markup` column says what
 will be transferred for each row (`name`, `signature`, `label`, `datatype`). The unmatched
 file lists your marked-up items that found no partner in the new build.
+
+The contenders file (`contenders_<source>_to_<target>.csv`) is for review. For each of
+your marked-up functions that is unmatched or paired with a confidence below 0.5, it lists
+up to five likely partners in the new build with a score from 0 to 1 and the reasons:
+identical code or start of code, size, shared strings and call arguments, paired callers
+and callees, and the distance from where the function is expected between its paired
+neighbours. Rank 0 is the current pair, scored the same way, so you can see whether a
+contender looks better. A contender that is already paired with another function says so.
+The pairing table never uses contenders; if you pick one, add or change the row in the
+pairing table yourself. With `ghidra-match pair`, ask for the file with
+`--contenders <file>` (`--contender-threshold` and `--max-contenders` change the limits).
 
 On Linux and macOS, `scripts/export_headless.sh` and `scripts/apply_headless.sh` wrap the
 headless export and apply.
@@ -177,9 +188,10 @@ Options are `key=value` pairs. There are three places to set them:
 |--------|---------|--------|
 | `min_confidence` | `0` | Skip pairs below this confidence. |
 | `names`, `signatures`, `data` | `true` | Set to `false` to leave that kind of markup out. |
-| `copy_types` | `local` | `local` copies every type defined in the source program. `all` also copies types from attached archives. `used` copies only the types the applied items need. |
+| `copy_types` | `local` | `local` copies every type defined in the source program or in one of the project's data type archives (for example the output of class recovery). `all` also copies types from file archives such as `windows_vs12_64`. `used` copies only the types the applied items need. |
 | `conflict` | `keep` | What happens when the target already has a type with the same path. `keep` uses the target's type, so no `.conflict` copies appear; empty placeholder structures in the target are still filled in from the source. `replace` overwrites the target's type with the source's. `rename` adds the source's type as `<name>.conflict`. |
-| `replace_signatures` | `true` | When the target function already has the source's name, apply the source signature even if a user set the target's. The report shows the prototype that was replaced. |
+| `replace_signatures` | `true` | When the target function already has the source's name (with or without its class), or both still have default `FUN_…` names, apply the source signature even if a user set the target's. The report shows the prototype that was replaced. |
+| `fix_namespaces` | `true` | When the target function has the source's name but not its class or namespace (`SetCameraState` instead of `WvContext::SetCameraState`), add the class or namespace. |
 | `overwrite` | `false` | Also replace names and signatures in the target that a user set or that were imported. |
 | `user_only` | `true` | With `false`, any non-default markup is transferred, including names from analysis and imports. |
 | `dry_run` | `false` | Only write the report. `apply.bat` sets this unless you pass `apply`. |
@@ -193,29 +205,40 @@ never guessed. All functions and data items take part, because unnamed neighbour
 what lead the matcher to your marked-up functions.
 
 1. Anchors. Identical names that occur once in each build (imports, RTTI
-   `Class::vftable` labels); identical sets of referenced strings; strings referenced by
-   exactly one function in each build; identical instruction-mnemonic hash and size;
-   string values that occur once (for data).
+   `Class::vftable` labels); identical sets of referenced strings; identical
+   instruction-mnemonic hash and size; identical sets of strings and constants passed to
+   the same call, such as the file path and line in
+   `errorContext("expr", "D:\…\List.h", 0x9d)`; strings referenced by exactly one function
+   in each build; string values that occur once (for data).
 2. Propagation, repeated until nothing changes. A vtable is paired when its already
    paired slot functions point to one vtable in the other build, and then its remaining
    slots are paired by index. A paired function's only unmatched callee or caller is
    paired, and callee lists of the same shape are paired by position. The same happens
    for data referenced by paired functions, and for the single function that references
-   a paired data item. Functions paired this way must have similar sizes
-   (`--size-ratio`, default 3).
+   a paired data item. For each source file path that functions report (with a line
+   number), the functions are sorted by line in both builds, and runs of unpaired ones
+   between paired ones are paired in line order. Functions paired this way must have
+   similar sizes (`--size-ratio`, default 3).
 3. Neighbours, once the steps above stop finding pairs. Most functions keep their link
    order between builds. When two matched functions have the same number of unmatched
    functions between them in both builds, and those have similar sizes, they are paired
    in order. This finds small getters and wrappers that have no strings, no callers and
    no vtable slot. `--no-neighbors` turns it off.
 
+Vtables and function-pointer tables often point to code that Ghidra never made into a
+function, because nothing calls it directly. The export includes these code entries, so a
+method you named in one build can be paired with the bare code label in the next;
+applying creates the function there.
+
 Confidence drops a little with each propagation step, so `min_confidence` can filter out
 pairs reached through long chains.
 
-Two builds of a 72,000-function x64 C++ program, a few weeks apart: 72,117 of 72,569
-functions were paired in about 45 seconds, including 1,321 of the 1,355 functions with
-user markup. With names hidden from the matcher (`--blind`), it paired 843 of the 845
-functions the user had named identically in both builds, and all 843 were correct.
+Two builds of a 72,000-function x64 C++ program, two weeks apart: 79,297 of 79,974
+functions and code entries were paired in about 40 seconds, including all 1,355 functions
+with user markup. With names hidden from the matcher (`--blind`), it paired all 845
+functions the user had named identically in both builds, all correctly. Between builds a
+month apart it paired 561 of 563 correctly; in the two others the user had named different
+copies of identical code in the two builds.
 
 ## Repository layout
 

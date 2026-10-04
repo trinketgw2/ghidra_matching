@@ -40,9 +40,12 @@ if not exist "%PAIRS%" (
   exit /b 1
 )
 
-set OPTS="report=%REPORT%" %APPLY_OPTIONS%
+rem Every option is quoted: Ghidra's analyzeHeadless.bat passes arguments through cmd, which
+rem splits unquoted key=value pairs. APPLY_OPTIONS is space separated, so quote each part.
+set OPTS="report=%REPORT%"
+if defined APPLY_OPTIONS set OPTS=%OPTS% "%APPLY_OPTIONS: =" "%"
 if /i "%MODE%"=="dry" (
-  set OPTS=%OPTS% dry_run=true
+  set OPTS=%OPTS% "dry_run=true"
 ) else if /i not "%MODE%"=="apply" (
   echo Third argument must be dry or apply.
   exit /b 2

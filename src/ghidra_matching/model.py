@@ -12,10 +12,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 #: Older formats that can still be read. Version 1 lacks name/signature sources, so every
-#: non-default name counts as user markup there.
-SUPPORTED_FORMAT_VERSIONS = (1, 2)
+#: non-default name counts as user markup there. Version 2 lacks code entries (defined=0).
+SUPPORTED_FORMAT_VERSIONS = (1, 2, 3)
 
 #: Ghidra SourceType names, lowest to highest priority.
 DEFAULT = "DEFAULT"
@@ -39,6 +39,10 @@ FUNCTION_COLUMNS = [
     "data_refs",
     "name_source",
     "signature_source",
+    "defined",
+    "head_size",
+    "head_hash",
+    "string_args",
 ]
 
 DATA_COLUMNS = [
@@ -78,6 +82,15 @@ class Function:
     data_refs: List[str] = field(default_factory=list)
     name_source: str = ""
     signature_source: str = ""
+    #: False for code that a table points to but Ghidra has no function for (size, hash and
+    #: references then cover the instructions up to the first return or jump).
+    defined: bool = True
+    #: Size and mnemonic hash of the code up to the first return or jump (comparable between
+    #: functions and code entries; empty in older exports).
+    head_size: int = 0
+    head_hash: str = ""
+    #: (string, small constant) passed to the same call, e.g. (source file path, line).
+    string_args: List[Tuple[str, int]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.name_source:
@@ -169,12 +182,20 @@ def _json_list(v: str) -> list:
     return json.loads(v) if v else []
 
 
-#: Columns added in format version 2; absent from version 1 files.
-_V2_COLUMNS = {"name_source", "signature_source", "custom_type"}
+#: Columns added after format version 1; absent from older files.
+_OPTIONAL_COLUMNS = {
+    "name_source",
+    "signature_source",
+    "custom_type",
+    "defined",
+    "head_size",
+    "head_hash",
+    "string_args",
+}
 
 
 def _check_columns(path: Path, header: Optional[List[str]], expected: List[str]) -> None:
-    missing = [c for c in expected if c not in (header or []) and c not in _V2_COLUMNS]
+    missing = [c for c in expected if c not in (header or []) and c not in _OPTIONAL_COLUMNS]
     if missing:
         raise ValueError(f"{path}: missing columns {missing}")
 
@@ -200,6 +221,10 @@ def load_functions(path: Path) -> Dict[str, Function]:
                 data_refs=[str(d) for d in _json_list(row["data_refs"])],
                 name_source=row.get("name_source") or "",
                 signature_source=row.get("signature_source") or "",
+                defined=_bool(row.get("defined") or "1"),
+                head_size=_int(row.get("head_size") or ""),
+                head_hash=row.get("head_hash") or "",
+                string_args=[(str(a), int(n)) for a, n in _json_list(row.get("string_args") or "")],
             )
             out[f.address] = f
     return out

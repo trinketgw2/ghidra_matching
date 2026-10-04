@@ -65,6 +65,7 @@ class MatchConfig:
 # Base confidences. Propagated pairs multiply the parent pair's confidence.
 CONF_NAME = 1.0
 CONF_STRING_SET = 0.95
+CONF_STRING_ARGS = 0.95
 CONF_BODY_HASH = 0.9
 CONF_STRING_VALUE = 0.9
 CONF_UNIQUE_STRING = 0.8
@@ -76,6 +77,8 @@ DECAY_DATA_REF_SINGLE = 0.9
 DECAY_DATA_REF_POSITIONAL = 0.8
 DECAY_DATA_REFERRER = 0.8
 DECAY_NEIGHBOR = 0.75
+DECAY_SOURCE_ORDER = 0.85
+CONF_SOURCE_ORDER = 0.8  # no paired function in the same file to lean on
 
 
 @dataclass
@@ -83,6 +86,9 @@ class MatchResult:
     source: Build
     target: Build
     pairs: List[Pair] = field(default_factory=list)
+    #: (kind, source) -> {target: (method, confidence)} for candidates that were rejected
+    #: because the source or the target had a competing candidate in the same step.
+    rejected: Dict[Tuple[str, str], Dict[str, Tuple[str, float]]] = field(default_factory=dict)
 
     def by_kind(self, kind: str) -> List[Pair]:
         return [p for p in self.pairs if p.kind == kind]
@@ -132,6 +138,8 @@ class Matcher:
         self.fwd: Dict[str, Dict[str, str]] = {FUNCTION: {}, DATA: {}}
         self.rev: Dict[str, Dict[str, str]] = {FUNCTION: {}, DATA: {}}
         self.pairs: Dict[Tuple[str, str], Pair] = {}
+        self._line_cache: Dict[int, Dict[str, Dict[str, int]]] = {}
+        self.rejected: Dict[Tuple[str, str], Dict[str, Tuple[str, float]]] = {}
 
     # ------------------------------------------------------------------ driver
 
@@ -140,8 +148,10 @@ class Matcher:
             self._anchor_names(FUNCTION, self.src.functions, self.tgt.functions)
             self._anchor_names(DATA, self.src.data, self.tgt.data)
         self._anchor_string_sets()
-        self._anchor_unique_strings()
+        # identical code beats shared (string, line) arguments: run the hash anchor first
         self._anchor_body_hash()
+        self._anchor_string_args()
+        self._anchor_unique_strings()
         self._anchor_string_values()
 
         if self.cfg.propagate:
@@ -151,6 +161,7 @@ class Matcher:
                 self._propagate_calls,
                 self._propagate_data_refs,
                 self._propagate_data_referrers,
+                self._propagate_source_order,
             )
             # neighbour pairing is the weakest evidence: only run it once the other steps
             # have converged, then let them build on what it found
@@ -162,7 +173,7 @@ class Matcher:
                     break
 
         pairs = sorted(self.pairs.values(), key=lambda p: (p.kind, p.source))
-        return MatchResult(self.src, self.tgt, pairs)
+        return MatchResult(self.src, self.tgt, pairs, self.rejected)
 
     # -------------------------------------------------------------- acceptance
 
@@ -182,6 +193,10 @@ class Matcher:
                 rev[t] = s
                 self.pairs[(kind, s)] = Pair(kind, s, t, method, round(conf, 4))
                 accepted += 1
+            else:
+                seen = self.rejected.setdefault((kind, s), {})
+                if conf > seen.get(t, ("", 0.0))[1]:
+                    seen[t] = (method, round(conf, 4))
         return accepted
 
     def _conf(self, kind: str, source: str) -> float:
@@ -198,10 +213,24 @@ class Matcher:
             return False
         if fs.is_thunk != ft.is_thunk:
             return False
+        if not fs.defined or not ft.defined:
+            return self._heads_agree(fs, ft)
         if fs.is_thunk or fs.size == 0 or ft.size == 0:
             return True
         ratio = max(fs.size, ft.size) / min(fs.size, ft.size)
         return ratio <= self.cfg.size_ratio
+
+    @staticmethod
+    def _heads_agree(fs: Function, ft: Function) -> bool:
+        """Code entries only have their first basic blocks: compare those with the other side.
+
+        Identical heads agree. Different heads agree only if they have the same size (an
+        edited instruction); anything else is a different piece of code. Without head data
+        (older exports) there is nothing to compare.
+        """
+        if not fs.head_hash or not ft.head_hash:
+            return True
+        return fs.head_hash == ft.head_hash or fs.head_size == ft.head_size
 
     def _data_compatible(self, s: str, t: str) -> bool:
         ds, dt = self.src.data.get(s), self.tgt.data.get(t)
@@ -247,6 +276,25 @@ class Matcher:
 
         return self._anchor_unique_keys(
             FUNCTION, "string_set", CONF_STRING_SET, keys(self.src), keys(self.tgt)
+        )
+
+    def _anchor_string_args(self) -> int:
+        """Pair functions with an identical set of (string, constant) call arguments.
+
+        Separates functions that share assert texts and file paths but sit at different lines,
+        e.g. errorContext("expr", "D:\\...\\List.h", 0x9d).
+        """
+
+        def keys(build: Build):
+            for a, f in build.functions.items():
+                args = tuple(
+                    sorted({x for x in f.string_args if len(x[0]) >= self.cfg.min_string_length})
+                )
+                if args:
+                    yield a, args
+
+        return self._anchor_unique_keys(
+            FUNCTION, "string_args", CONF_STRING_ARGS, keys(self.src), keys(self.tgt)
         )
 
     def _anchor_unique_strings(self) -> int:
@@ -317,20 +365,41 @@ class Matcher:
         return self._accept(DATA, "vtable_votes", cands)
 
     def _propagate_vtable_slots(self) -> int:
-        """Pair functions at the same slot index of paired vtables."""
-        fmap = self.fwd[FUNCTION]
+        """Pair functions at the same slot index of paired vtables.
+
+        A slot is paired only where the layouts are known to line up: the nearest already
+        paired slot before it and the nearest one after it (where they exist) must be paired
+        with the target slot at the same index, and at least one of them must exist unless
+        both tables have the same length. A slot inserted or removed in the new build thus
+        stops the pairing at the point where the indices start to disagree.
+        """
+        fmap, frev = self.fwd[FUNCTION], self.rev[FUNCTION]
         cands: Candidates = {}
         for va, vb in self.fwd[DATA].items():
             vs, vt = self.src.data.get(va), self.tgt.data.get(vb)
             if vs is None or vt is None or vs.kind != "vtable" or vt.kind != "vtable":
                 continue
             conf = self._conf(DATA, va) * DECAY_VTABLE_SLOT
-            for s, t in zip(vs.slots, vt.slots):
-                if s in fmap:
-                    if fmap[s] != t:
-                        break  # layouts diverge from here on
+            n = min(len(vs.slots), len(vt.slots))
+            # per index: True = paired with the same index, False = paired elsewhere
+            state = [
+                (fmap[vs.slots[i]] == vt.slots[i]) if vs.slots[i] in fmap else None
+                for i in range(n)
+            ]
+            same_length = len(vs.slots) == len(vt.slots)
+            for i in range(n):
+                s, t = vs.slots[i], vt.slots[i]
+                if state[i] is not None or t in frev:
                     continue
-                if t not in self.rev[FUNCTION] and self._plausible(s, t):
+                before = next(
+                    (state[j] for j in range(i - 1, -1, -1) if state[j] is not None), None
+                )
+                after = next((state[j] for j in range(i + 1, n) if state[j] is not None), None)
+                if before is False or after is False:
+                    continue
+                if before is None and after is None and not same_length:
+                    continue
+                if self._plausible(s, t):
                     self._add(cands, s, t, conf)
         return self._accept(FUNCTION, "vtable_slot", cands)
 
@@ -408,6 +477,58 @@ class Matcher:
                 self._add(cands, rs[0], rt[0], self._conf(DATA, s) * DECAY_DATA_REFERRER)
         return self._accept(FUNCTION, "data_referrer", cands)
 
+    def _source_lines(self, build: Build) -> Dict[str, Dict[str, int]]:
+        """source file path -> {function: first line it reports for that file}."""
+        cache = self._line_cache.get(id(build))
+        if cache is None:
+            cache = defaultdict(dict)
+            for a, f in build.functions.items():
+                for text, n in f.string_args:
+                    if _looks_like_source_path(text):
+                        prev = cache[text].get(a)
+                        if prev is None or n < prev:
+                            cache[text][a] = n
+            self._line_cache[id(build)] = cache
+        return cache
+
+    def _propagate_source_order(self) -> int:
+        """Pair functions of one source file by the order of the line numbers they report.
+
+        Lines shift between builds, but their order does not. For each file path, the
+        functions reporting it are sorted by line in both builds; between two functions that
+        are already paired (or at either end), runs with the same number of unpaired
+        functions, in strictly increasing line order, are paired in order.
+        """
+        fmap, frev = self.fwd[FUNCTION], self.rev[FUNCTION]
+        src_files, tgt_files = self._source_lines(self.src), self._source_lines(self.tgt)
+        cands: Candidates = {}
+        for path in src_files.keys() & tgt_files.keys():
+            s_list = sorted(src_files[path].items(), key=lambda kv: (kv[1], kv[0]))
+            t_list = sorted(tgt_files[path].items(), key=lambda kv: (kv[1], kv[0]))
+            t_pos = {a: i for i, (a, _) in enumerate(t_list)}
+            # anchors: paired functions present in both lists, in source order
+            anchors = [
+                (i, t_pos[fmap[a]]) for i, (a, _) in enumerate(s_list) if fmap.get(a) in t_pos
+            ]
+            if any(b[1] <= a[1] for a, b in zip(anchors, anchors[1:])):
+                continue  # order disagrees; leave this file alone
+            bounds = [(-1, -1)] + anchors + [(len(s_list), len(t_list))]
+            for (si, ti), (sj, tj) in zip(bounds, bounds[1:]):
+                seg_s = [x for x in s_list[si + 1 : sj] if x[0] not in fmap]
+                seg_t = [x for x in t_list[ti + 1 : tj] if x[0] not in frev]
+                if not seg_s or len(seg_s) != len(seg_t):
+                    continue
+                if not (_strictly_increasing(seg_s) and _strictly_increasing(seg_t)):
+                    continue
+                inner = [
+                    self._conf(FUNCTION, s_list[k][0]) for k in (si, sj) if 0 <= k < len(s_list)
+                ]
+                conf = min(inner) * DECAY_SOURCE_ORDER if inner else CONF_SOURCE_ORDER
+                for (a, _), (b, _) in zip(seg_s, seg_t):
+                    if self._plausible(a, b):
+                        self._add(cands, a, b, conf)
+        return self._accept(FUNCTION, "source_order", cands)
+
     def _propagate_neighbors(self) -> int:
         """Pair runs of unmatched functions that sit between the same matched neighbours.
 
@@ -430,6 +551,11 @@ class Matcher:
                 pi, pj = prev
                 gap_s = src_order[pi + 1 : i]
                 gap_t = tgt_order[pj + 1 : j] if j > pj else []
+                if len(gap_s) != len(gap_t):
+                    # a code entry present in only one build shifts the count; retry with
+                    # real functions only
+                    gap_s = [a for a in gap_s if self.src.functions[a].defined]
+                    gap_t = [b for b in gap_t if self.tgt.functions[b].defined]
                 if (
                     gap_s
                     and len(gap_s) == len(gap_t) <= self.cfg.max_neighbor_gap
@@ -449,9 +575,22 @@ class Matcher:
         fs, ft = self.src.functions[s], self.tgt.functions[t]
         if fs.is_thunk != ft.is_thunk:
             return False
+        if not fs.defined or not ft.defined:
+            return self._heads_agree(fs, ft)  # a code entry's size covers only its head
         if fs.size == 0 or ft.size == 0:
             return fs.size == ft.size
         return max(fs.size, ft.size) / min(fs.size, ft.size) <= self.cfg.neighbor_size_ratio
+
+
+_SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".m", ".mm")
+
+
+def _looks_like_source_path(text: str) -> bool:
+    return ("\\" in text or "/" in text) and text.lower().endswith(_SOURCE_SUFFIXES)
+
+
+def _strictly_increasing(items: List[Tuple[str, int]]) -> bool:
+    return all(a[1] < b[1] for a, b in zip(items, items[1:]))
 
 
 def _address_order(items: dict) -> List[str]:

@@ -24,17 +24,20 @@
 //   names=true           apply function / data names and namespaces
 //   signatures=true      apply function signatures
 //   data=true            apply data types at paired data addresses
-//   copy_types=local     local: copy all types defined in the source program first
-//                        all:   also types from attached archives; used: only types needed
-//                        by applied signatures and data
+//   copy_types=local     local: copy all types defined in the source program or in project
+//                        data type archives first; all: also types from file archives (.gdt);
+//                        used: only types needed by applied signatures and data
 //   conflict=keep        a type that already exists in the target (same path) is reused and
 //                        left as is, except empty placeholder structures/unions, which get the
 //                        source definition. replace: source definition wins. rename: add the
 //                        source version as <name>.conflict. replace_empty: fill empty
 //                        placeholders, otherwise add a .conflict copy.
 //   user_only=true       only transfer markup made by a user (false: any non-default markup)
-//   replace_signatures=true  when the target function already has the source's name, apply
-//                        the source signature even if the target's was set by a user
+//   replace_signatures=true  when the target function already has the source's name (with or
+//                        without namespace, or both have default names), apply the source
+//                        signature even if the target's was set by a user
+//   fix_namespaces=true  when the target has the source's name but no class/namespace, add the
+//                        source's class/namespace
 //   overwrite=false      also replace target markup that was set by a user or imported
 //   dry_run=false        only report what would change
 //   report=<path.csv>    write one row per action / skip
@@ -106,6 +109,7 @@ public class ApplyMatchTable extends GhidraScript {
 	private boolean userOnly = true;
 	private boolean overwrite = false;
 	private boolean replaceSignatures = true;
+	private boolean fixNamespaces = true;
 	private boolean dryRun = false;
 	private File reportFile;
 
@@ -125,11 +129,18 @@ public class ApplyMatchTable extends GhidraScript {
 			Map<String, String> opts = new HashMap<>();
 			for (int i = 2; i < args.length; i++) {
 				int eq = args[i].indexOf('=');
-				if (eq <= 0) {
+				if (eq > 0) {
+					opts.put(args[i].substring(0, eq).trim().toLowerCase(),
+						args[i].substring(eq + 1).trim());
+				}
+				else if (i + 1 < args.length && args[i].indexOf('=') < 0) {
+					// Windows: analyzeHeadless.bat passes arguments through cmd, which splits
+					// an unquoted key=value into "key" and "value"
+					opts.put(args[i].trim().toLowerCase(), args[++i].trim());
+				}
+				else {
 					throw new IllegalArgumentException("Expected key=value, got: " + args[i]);
 				}
-				opts.put(args[i].substring(0, eq).trim().toLowerCase(),
-					args[i].substring(eq + 1).trim());
 			}
 			minConfidence = Double.parseDouble(opts.getOrDefault("min_confidence", "0"));
 			applyNames = bool(opts, "names", true);
@@ -140,6 +151,7 @@ public class ApplyMatchTable extends GhidraScript {
 			userOnly = bool(opts, "user_only", true);
 			overwrite = bool(opts, "overwrite", false);
 			replaceSignatures = bool(opts, "replace_signatures", true);
+			fixNamespaces = bool(opts, "fix_namespaces", true);
 			dryRun = bool(opts, "dry_run", false);
 			conflict = opts.getOrDefault("conflict", conflict);
 			if (opts.containsKey("report")) {
@@ -282,6 +294,14 @@ public class ApplyMatchTable extends GhidraScript {
 			if (tf != null && sameName(sf.getSymbol(), tf.getSymbol())) {
 				count("unchanged_name");
 			}
+			else if (tf != null && fixNamespaces && sf.getName().equals(tf.getName()) &&
+				tf.getParentNamespace().isGlobal() && !sf.getParentNamespace().isGlobal()) {
+				// the target has the same name without its class or namespace
+				if (!dryRun) {
+					tf.getSymbol().setNamespace(copyNamespace(sf.getParentNamespace()));
+				}
+				record(row, "namespace", sf.getName(true));
+			}
 			else if (tf != null && !mayReplace(tf.getSymbol().getSource())) {
 				record(row, "skip_name", "target has " + tf.getName(true) + " (" +
 					tf.getSymbol().getSource() + ")");
@@ -301,7 +321,7 @@ public class ApplyMatchTable extends GhidraScript {
 				count("unchanged_signature");
 			}
 			else if (tf != null && !mayReplace(tf.getSignatureSource()) &&
-				!(replaceSignatures && sameName(sf.getSymbol(), tf.getSymbol()))) {
+				!(replaceSignatures && sameBaseName(sf, tf))) {
 				record(row, "skip_signature", "target has " + tf.getSignature(true).getPrototypeString() +
 					" (" + tf.getSignatureSource() + ")");
 			}
@@ -430,7 +450,11 @@ public class ApplyMatchTable extends GhidraScript {
 		stats.put("types_copied", n);
 	}
 
-	/** Defined in the program itself rather than taken from an attached archive (.gdt). */
+	/**
+	 * Defined in the program or in one of the project's data type archives (user work, e.g. the
+	 * output of class recovery), as opposed to a standard file archive (.gdt) such as
+	 * windows_vs12_64 that every program gets anyway.
+	 */
 	private static boolean isLocalType(DataType dt, UniversalID localArchive) {
 		SourceArchive archive = dt.getSourceArchive();
 		if (archive == null) {
@@ -438,7 +462,8 @@ public class ApplyMatchTable extends GhidraScript {
 		}
 		UniversalID id = archive.getSourceArchiveID();
 		return localArchive.equals(id) || DataTypeManager.LOCAL_ARCHIVE_UNIVERSAL_ID.equals(id) ||
-			archive.getArchiveType() == ArchiveType.PROGRAM;
+			archive.getArchiveType() == ArchiveType.PROGRAM ||
+			archive.getArchiveType() == ArchiveType.PROJECT;
 	}
 
 	// ----------------------------------------------------------------- helpers
@@ -464,6 +489,18 @@ public class ApplyMatchTable extends GhidraScript {
 		}
 		cur.setComment(sig.getComment());
 		return sig.isEquivalentSignature(cur);
+	}
+
+	/**
+	 * Same name ignoring the class/namespace; two default names (FUN_<address>) also count,
+	 * since they only differ by address.
+	 */
+	private static boolean sameBaseName(Function a, Function b) {
+		if (a.getSymbol().getSource() == SourceType.DEFAULT &&
+			b.getSymbol().getSource() == SourceType.DEFAULT) {
+			return true;
+		}
+		return a.getName().equals(b.getName());
 	}
 
 	private static boolean sameName(Symbol a, Symbol b) {

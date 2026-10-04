@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .config import REPO, Preferences
+from .contenders import write_contenders
 from .matcher import MatchConfig, match
 from .model import load_build
 from .pairing import write_pairs, write_unmatched
@@ -281,8 +282,10 @@ class Pipeline:
         result = match(src_build, tgt_build, MatchConfig())
         pairs = self.s.out / f"pairs_{src.label}_to_{tgt.label}.csv"
         unmatched = self.s.out / f"unmatched_{src.label}_to_{tgt.label}.csv"
+        contenders = self.s.out / f"contenders_{src.label}_to_{tgt.label}.csv"
         n = write_pairs(result, pairs)
         u = write_unmatched(result, unmatched)
+        c = write_contenders(result, contenders)
         f = result.stats()["function"]
         self.log(f"  done in {_clock(time.time() - t0)}")
         self.log("")
@@ -292,6 +295,7 @@ class Pipeline:
         )
         self.log(f"Pairing table ({n:,} items with your markup): {pairs}")
         self.log(f"Unmatched items with your markup ({u:,}): {unmatched}")
+        self.log(f"Contenders for unmatched or weakly paired functions ({c:,}): {contenders}")
         self.log("")
         if src.project != tgt.project:
             self.log("Source and target are in different Ghidra projects; apply needs both in one.")

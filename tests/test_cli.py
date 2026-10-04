@@ -163,3 +163,34 @@ def test_parse_build_forms():
         parse_build("v1.1", None, "app.exe")
     with pytest.raises(PipelineError, match="No program"):
         parse_build("v1.1", "Proj", None)
+
+
+def test_contenders_for_ambiguous_function(tmp_path):
+    # two identical unnamed copies in the target: the matcher pairs neither, the
+    # contenders list both
+    src = build("v1", [fn("1000", "Player::Update", mnemonic_hash="h1", insn_count=40, size=64)])
+    tgt = build(
+        "v2",
+        [
+            fn("2000", mnemonic_hash="h1", insn_count=40, size=64),
+            fn("3000", mnemonic_hash="h1", insn_count=40, size=64),
+            fn("4000", mnemonic_hash="zz", insn_count=40, size=500),
+        ],
+    )
+    out = tmp_path / "contenders.csv"
+    args = [
+        "pair",
+        write_export(src, tmp_path),
+        write_export(tgt, tmp_path),
+        "-o",
+        str(tmp_path / "p.csv"),
+        "--contenders",
+        str(out),
+        "--blind",
+    ]
+    assert main(args) == 0
+    with open(out, newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert {r["contender_address"] for r in rows} == {"2000", "3000"}
+    assert all(r["status"] == "unmatched" for r in rows)
+    assert "identical code" in rows[0]["reasons"]

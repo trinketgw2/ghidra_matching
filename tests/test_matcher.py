@@ -217,3 +217,49 @@ def test_neighbor_pairing_needs_equal_gap_and_similar_size():
     assert "1010" not in pairs_of(match(src, uneven))
     resized = build("t", [fn("2000", "a"), fn("2010", size=100), fn("2040", "b")])
     assert "1010" not in pairs_of(match(src, resized))
+
+
+def test_string_args_separate_same_strings_at_different_lines():
+    path = "D:\\src\\List.h"
+    src = build(
+        "s",
+        [
+            fn("1", string_refs=["cond", path], string_args=[("cond", 1), (path, 157)]),
+            fn("2", string_refs=["cond", path], string_args=[("cond", 1), (path, 170)]),
+        ],
+    )
+    tgt = build(
+        "t",
+        [
+            fn("b", string_refs=["cond", path], string_args=[("cond", 1), (path, 170)]),
+            fn("a", string_refs=["cond", path], string_args=[("cond", 1), (path, 157)]),
+        ],
+    )
+    got = pairs_of(match(src, tgt, MatchConfig(propagate=False)))
+    assert got == {"1": ("a", "string_args"), "2": ("b", "string_args")}
+
+
+def test_source_order_pairs_by_line_order_within_file():
+    path = "D:\\src\\Combat\\CmbtCliMsg.cpp"
+    # lines moved by a few between builds; order is kept; "anchor" pairs by name
+    src = build(
+        "s",
+        [
+            fn("1", string_args=[(path, 0x30)]),
+            fn("2", "anchor", string_args=[(path, 0x35)]),
+            fn("3", string_args=[(path, 0x50)]),
+            fn("4", string_args=[(path, 0x60)]),
+        ],
+    )
+    tgt = build(
+        "t",
+        [
+            fn("a", string_args=[(path, 0x32)]),
+            fn("b", "anchor", string_args=[(path, 0x37)]),
+            fn("c", string_args=[(path, 0x58)]),
+            fn("d", string_args=[(path, 0x66)]),
+        ],
+    )
+    got = pairs_of(match(src, tgt, MatchConfig(use_neighbors=False)))
+    assert {k: v[0] for k, v in got.items()} == {"1": "a", "2": "b", "3": "c", "4": "d"}
+    assert got["3"][1] == "source_order"

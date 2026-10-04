@@ -63,8 +63,9 @@ def test_reads_format_1_exports(tmp_path):
     for name in ("v1.functions.csv", "v1.data.csv"):
         path = tmp_path / name
         rows = path.read_text().splitlines()
-        # drop the two columns added in format 2
-        path.write_text("\n".join(",".join(r.split(",")[:-2]) for r in rows) + "\n")
+        # drop the columns added after format 1
+        cut = 6 if name == "v1.functions.csv" else 2
+        path.write_text("\n".join(",".join(r.split(",")[:-cut]) for r in rows) + "\n")
     (tmp_path / "v1.meta.json").write_text(json.dumps({"format_version": 1}))
     b = load_build(prefix)
     assert b.format_version == 1

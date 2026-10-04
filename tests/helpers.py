@@ -55,6 +55,10 @@ def write_export(b: Build, directory: Path) -> str:
                     json.dumps(f.data_refs),
                     f.name_source,
                     f.signature_source,
+                    int(f.defined),
+                    f.head_size,
+                    f.head_hash,
+                    json.dumps([list(x) for x in f.string_args]),
                 ]
             )
     with open(f"{prefix}.data.csv", "w", newline="", encoding="utf-8") as fh:
@@ -78,6 +82,6 @@ def write_export(b: Build, directory: Path) -> str:
                 ]
             )
     Path(f"{prefix}.meta.json").write_text(
-        json.dumps({"format_version": 2, "label": b.label}), encoding="utf-8"
+        json.dumps({"format_version": 3, "label": b.label}), encoding="utf-8"
     )
     return str(prefix)
