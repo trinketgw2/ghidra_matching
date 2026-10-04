@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Ghidra
+*.gpr
+*.rep/
+*.lock
+*.lock~
+ghidra_scripts/*.class
+
+# Local working output (commit exports/ and pairs you want to keep explicitly)
+out/
+*.log
+
+# Binaries do not belong in the repo
+*.exe
+*.dll
+*.so
+*.dylib
+*.elf
+*.bin
+
+# Personal settings (template: user_preferences.example.cfg)
+user_preferences.cfg
+
+# Local data: exports, pairing tables/reports/logs, packed Ghidra programs
+/exports/*
+!/exports/README.md
+/programs/
+/pairs/
+*.gzf
